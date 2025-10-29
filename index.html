@@ -1,11 +1,235 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="ko">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hello World</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>TeachableMachine Character Control</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, 'Noto Sans KR', sans-serif; margin:0; display:flex; gap:20px; padding:20px; box-sizing:border-box; background:#f4f6f8; }
+    /* Left: canvas/webcam + labels */
+    #left { width:360px; }
+    #webcam-container { width:320px; height:320px; background:#000; border-radius:8px; overflow:hidden; }
+    #labels { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; }
+    .label { background:#fff; padding:6px 8px; border-radius:6px; box-shadow:0 1px 3px rgba(0,0,0,.08); font-size:13px; }
+    /* Right: game area */
+    #game-area { flex:1; min-height:420px; background:linear-gradient(#9be7ff,#fff); border-radius:12px; position:relative; padding:16px; box-shadow:0 6px 18px rgba(10,20,30,.08); }
+    #stage { width:100%; height:360px; background:linear-gradient(#a0f0a8,#4caf50); border-radius:8px; position:relative; overflow:hidden; }
+    #player { width:64px; height:64px; position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); transition:left .08s linear, top .08s linear; }
+    /* simple sprite-like appearance */
+    #player .body { width:100%; height:100%; background:#ffcc00; border-radius:10px; display:flex; align-items:center; justify-content:center; font-weight:700; color:#222; font-size:22px; box-shadow:0 6px 12px rgba(0,0,0,.12); }
+    /* controls / info */
+    #info { margin-top:12px; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    .btn { padding:8px 12px; background:#fff; border-radius:8px; cursor:pointer; box-shadow:0 1px 3px rgba(0,0,0,.06); }
+    #status { font-size:14px; }
+  </style>
 </head>
 <body>
-    <h1>Hello, world!</h1>
+  <div id="left">
+    <div id="webcam-container"></div>
+    <div id="labels"></div>
+    <div id="info">
+      <div class="btn" id="start-btn">Start</div>
+      <div class="btn" id="stop-btn">Stop</div>
+      <div id="status">상태: 대기</div>
+    </div>
+    <p style="font-size:12px;color:#666;margin-top:10px;">
+      모델 클래스: <strong>L</strong>, <strong>R</strong>, <strong>U</strong>, <strong>None</strong>
+    </p>
+  </div>
+
+  <div id="game-area">
+    <h3 style="margin:0 0 10px 0">캐릭터 컨트롤 게임</h3>
+    <div id="stage" aria-label="Game stage">
+      <div id="player" role="img" aria-label="player">
+        <div class="body">🙂</div>
+      </div>
+    </div>
+    <div style="margin-top:10px;font-size:13px;color:#333">
+      인식된 클래스: <span id="detected">—</span>
+      &nbsp;&nbsp;|&nbsp;&nbsp;
+      확신도: <span id="confidence">—</span>
+    </div>
+  </div>
+
+  <!-- tfjs and teachablemachine library -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
+
+  <script>
+    // 모델 URL (Teachable Machine export 페이지에서 받은 링크의 모델.json 위치)
+    const MODEL_BASE = "https://teachablemachine.withgoogle.com/models/kS8uSK-ra/";
+    const modelURL = MODEL_BASE + "model.json";
+    const metadataURL = MODEL_BASE + "metadata.json";
+
+    // 게임/캐릭터 설정 (값 필요하면 여기 수정)
+    const STEP = 8;           // 한 프레임당 이동 픽셀
+    const SMOOTH = 0.9;       // 위치 보간(0..1). 1은 즉시 이동
+    const WIDTH = 320;        // webcam 캔버스 크기
+
+    let model, webcam, maxPredictions;
+    let running = false;
+    let lastPrediction = {className: "None", probability: 0};
+
+    // DOM
+    const webcamContainer = document.getElementById("webcam-container");
+    const labelsDiv = document.getElementById("labels");
+    const startBtn = document.getElementById("start-btn");
+    const stopBtn = document.getElementById("stop-btn");
+    const status = document.getElementById("status");
+    const detectedSpan = document.getElementById("detected");
+    const confidenceSpan = document.getElementById("confidence");
+
+    // Game elements
+    const stage = document.getElementById("stage");
+    const player = document.getElementById("player");
+    const stageRect = { w: null, h: null };
+
+    // 위치 상태 (픽셀, left/top in px)
+    let pos = { x: null, y: null, tx: null, ty: null };
+
+    async function initModelAndWebcam() {
+      status.textContent = "상태: 모델 로딩 중...";
+      model = await tmImage.load(modelURL, metadataURL);
+      maxPredictions = model.getTotalClasses();
+      status.textContent = "상태: 웹캠 설정 중...";
+      webcam = new tmImage.Webcam(WIDTH, WIDTH, true);
+      await webcam.setup();
+      await webcam.play();
+      // attach the webcam canvas
+      webcamContainer.innerHTML = "";
+      webcamContainer.appendChild(webcam.canvas);
+      // labels
+      labelsDiv.innerHTML = "";
+      for (let i=0; i<maxPredictions; i++){
+        const d = document.createElement("div");
+        d.className = "label";
+        d.id = "label-"+i;
+        d.textContent = model.getClassLabel(i) || `class${i}`;
+        labelsDiv.appendChild(d);
+      }
+      // init positions
+      const s = stage.getBoundingClientRect();
+      stageRect.w = s.width;
+      stageRect.h = s.height;
+      pos.x = stageRect.w/2 - 32;
+      pos.y = stageRect.h/2 - 32;
+      pos.tx = pos.x;
+      pos.ty = pos.y;
+      updatePlayerPos(true);
+      status.textContent = "상태: 준비됨";
+    }
+
+    async function startLoop() {
+      if (!model || !webcam) await initModelAndWebcam();
+      running = true;
+      status.textContent = "상태: 실행 중";
+      loop();
+    }
+    function stopLoop() {
+      running = false;
+      status.textContent = "상태: 정지";
+      detectedSpan.textContent = "—";
+      confidenceSpan.textContent = "—";
+    }
+
+    async function loop() {
+      if (!running) return;
+      webcam.update();
+      await predict();
+      applyGameControl();
+      // smooth interpolate to target
+      pos.x = pos.x * SMOOTH + pos.tx * (1 - SMOOTH);
+      pos.y = pos.y * SMOOTH + pos.ty * (1 - SMOOTH);
+      updatePlayerPos();
+      requestAnimationFrame(loop);
+    }
+
+    async function predict() {
+      // model.predict expects canvas/video/img
+      const prediction = await model.predict(webcam.canvas);
+      // find top class
+      let best = {className:"None", probability:0, index:-1};
+      for (let i=0;i<prediction.length;i++){
+        const p = prediction[i].probability;
+        if (p > best.probability) best = {className: prediction[i].className, probability: p, index: i};
+      }
+      // update labels display
+      for (let i=0;i<prediction.length;i++){
+        const el = document.getElementById("label-"+i);
+        if (!el) continue;
+        const prob = prediction[i].probability;
+        el.style.opacity = (prob).toFixed(2);
+        el.textContent = `${model.getClassLabel(i)}: ${prob.toFixed(2)}`;
+      }
+      lastPrediction = best;
+      detectedSpan.textContent = best.className;
+      confidenceSpan.textContent = best.probability.toFixed(2);
+    }
+
+    function applyGameControl() {
+      // 기본 동작: L -> 좌, R -> 우, U -> 위(점프), None -> 감속/정지
+      const c = lastPrediction.className;
+      // 안전성: class 이름들이 대소문자/공백 섞여 있을 수 있으니 정규화
+      const key = String(c).trim();
+      // set target positions
+      const leftBound = 8;
+      const rightBound = stageRect.w - 8 - 64;
+      const groundY = stageRect.h - 8 - 64; // 바닥 위치
+      if (pos.tx === null) { pos.tx = pos.x; pos.ty = pos.y; }
+
+      if (key === "L") {
+        pos.tx = Math.max(leftBound, pos.tx - STEP);
+        // keep on ground
+        pos.ty = groundY;
+      } else if (key === "R") {
+        pos.tx = Math.min(rightBound, pos.tx + STEP);
+        pos.ty = groundY;
+      } else if (key === "U") {
+        // simple jump: instant set ty above, then it will fall back to ground via easing each frame
+        pos.ty = Math.max(16, pos.ty - 80);
+      } else { // None or unrecognized
+        // slowly return to ground and don't move horizontally
+        pos.ty = pos.ty * 0.92 + groundY * 0.08;
+        // apply small friction to tx (stop)
+        pos.tx = pos.tx * 0.92 + pos.x * 0.08;
+      }
+
+      // keep bounds
+      pos.tx = Math.max(leftBound, Math.min(rightBound, pos.tx));
+      pos.ty = Math.max(8, Math.min(groundY, pos.ty));
+    }
+
+    function updatePlayerPos(force) {
+      if (pos.x === null || pos.y === null) return;
+      // set style left/top
+      player.style.left = (pos.x) + "px";
+      player.style.top = (pos.y) + "px";
+      if (force) player.style.transition = "none";
+      else player.style.transition = "";
+    }
+
+    // Buttons
+    startBtn.addEventListener("click", async () => {
+      try {
+        await startLoop();
+      } catch (e) {
+        console.error(e);
+        status.textContent = "상태: 에러 — 카메라 접근 또는 모델 로드 실패";
+      }
+    });
+    stopBtn.addEventListener("click", () => stopLoop());
+
+    // Auto-init minimal to pre-load model metadata (optional)
+    (async ()=> {
+      try {
+        // prefetch metadata to know classes (no webcam yet)
+        const md = await fetch(metadataURL);
+        if (md.ok) {
+          const json = await md.json();
+          // nothing else needed
+        }
+      } catch(e){}
+    })();
+  </script>
 </body>
 </html>
